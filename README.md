@@ -105,13 +105,12 @@ Shipment Service commits State: "Active"                                        
 ## ⚙️ Declarative Cluster Definition (`docker-compose.yml`)
 
 The infrastructure definitions are meticulously configured with automated, strict startup order dependencies (`healthcheck` validations) to avoid bootstrap network drops:
-
-```yaml
 version: '3.8'
 
 networks:
   shipping_sovereign_network:
     driver: bridge
+    name: shipping_sovereign_network
 
 volumes:
   postgres_ledger_data:
@@ -120,121 +119,232 @@ volumes:
   kafka_data:
 
 services:
-  # State Storage Nodes
+
+  # =========================
+  # POSTGRES (Ledger DB)
+  # =========================
   postgres-ledger-db:
     image: postgres:15-alpine
     container_name: postgres-ledger-db
     networks:
       - shipping_sovereign_network
+    ports:
+      - "5432:5432"
     volumes:
       - postgres_ledger_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: ledger_admin
+      POSTGRES_PASSWORD: StrongLedgerPassword2026
+      POSTGRES_DB: ledger_master_db
+    restart: always
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U ledger_admin"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
 
+
+  # =========================
+  # MONGODB
+  # =========================
   mongo-shipment-db:
     image: mongo:6.0
     container_name: mongo-shipment-db
     networks:
       - shipping_sovereign_network
+    ports:
+      - "27017:27017"
     volumes:
       - mongo_shipment_data:/data/db
+    restart: always
 
+
+  # =========================
+  # REDIS
+  # =========================
   redis-distributed-cache:
     image: redis:7.0-alpine
     container_name: redis-distributed-cache
     networks:
       - shipping_sovereign_network
+    ports:
+      - "6379:6379"
     volumes:
       - redis_cache_data:/data
+    restart: always
 
+
+  # =========================
+  # ZOOKEEPER + KAFKA
+  # =========================
   zookeeper:
     image: confluentinc/cp-zookeeper:7.3.0
-    container_name: zookeeper
+    container_name: zookeeper-broker
     networks:
       - shipping_sovereign_network
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
 
   kafka:
     image: confluentinc/cp-kafka:7.3.0
-    container_name: kafka
+    container_name: kafka-broker
     networks:
       - shipping_sovereign_network
-    ports:
-      - "9092:9092"
     depends_on:
       - zookeeper
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
-      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
-      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
 
-  # Application Deployment Blueprint Nodes
+
+  # =========================
+  # MIGRATION SERVICE (IMPORTANT 🔥)
+  # =========================
+  ledger-migrations:
+    image: mcr.microsoft.com/dotnet/sdk:8.0
+    container_name: ledger-migrations
+    working_dir: /src
+    volumes:
+      - ./ledger-service/LedgerService:/src
+    networks:
+      - shipping_sovereign_network
+    depends_on:
+      postgres-ledger-db:
+        condition: service_healthy
+    entrypoint: ["bash", "-c"]
+    command: >
+      "dotnet tool install --global dotnet-ef &&
+       export PATH=$PATH:/root/.dotnet/tools &&
+       dotnet ef database update"
+
+
+  # =========================
+  # SERVICES
+  # =========================
+
   gateway-service:
-    build: ./gateway-service
+    build:
+      context: ./gateway-service/GatewayService
+      dockerfile: Dockerfile
     container_name: gateway-service
+    networks:
+      - shipping_sovereign_network
+    depends_on:
+      - kafka
+      - postgres-ledger-db
+      - mongo-shipment-db
     ports:
       - "8080:8080"
-    networks:
-      - shipping_sovereign_network
-    depends_on:
-      postgres-ledger-db:
-        condition: service_healthy
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_URLS: http://+:8080
+    restart: unless-stopped
+
 
   ledger-service:
-    build: ./ledger-service
+    build:
+      context: ./ledger-service/LedgerService
+      dockerfile: Dockerfile
     container_name: ledger-service
-    ports:
-      - "8081:8080"
     networks:
       - shipping_sovereign_network
     depends_on:
       postgres-ledger-db:
         condition: service_healthy
+    ports:
+      - "8081:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_URLS: http://+:8080
+    restart: unless-stopped
+
+
+  fraud-service:
+    build:
+      context: ./fraud-service/FraudService
+      dockerfile: Dockerfile
+    container_name: fraud-service
+    networks:
+      - shipping_sovereign_network
+    depends_on:
+      - kafka
+      - redis-distributed-cache
+      - postgres-ledger-db
+    restart: unless-stopped
+
+
+  orchestrator-service:
+    build:
+      context: ./orchestrator-service/OrchestratorService
+      dockerfile: Dockerfile
+    container_name: orchestrator-service
+    networks:
+      - shipping_sovereign_network
+    depends_on:
+      - kafka
+      - redis-distributed-cache
+      - postgres-ledger-db
+    restart: unless-stopped
+
+
+  intelligence-service:
+    build:
+      context: ./intelligence-service
+      dockerfile: Dockerfile
+    container_name: intelligence-service
+    networks:
+      - shipping_sovereign_network
+    depends_on:
+      - kafka
+      - redis-distributed-cache
+      - mongo-shipment-db
+    ports:
+      - "3001:3000"
+    environment:
+      PORT: 3000
+    restart: unless-stopped
+
+
+  message-broker-service:
+    build:
+      context: ./message-broker-service
+      dockerfile: Dockerfile
+    container_name: message-broker-service
+    networks:
+      - shipping_sovereign_network
+    depends_on:
+      - kafka
+    ports:
+      - "3002:3000"
+    environment:
+      PORT: 3000
+    restart: unless-stopped
+
 
   shipment-service:
-    build: ./shipment-service
+    build:
+      context: ./shipment-service/shipment-app
+      dockerfile: Dockerfile
     container_name: shipment-service
-    ports:
-      - "3003:3000"
     networks:
       - shipping_sovereign_network
     depends_on:
       - kafka
       - mongo-shipment-db
-
-  intelligence-service:
-    build: ./intelligence-service
-    container_name: intelligence-service
     ports:
-      - "3001:3000"
-    networks:
-      - shipping_sovereign_network
-
-  message-broker-service:
-    build: ./message-broker-service
-    container_name: message-broker-service
-    ports:
-      - "3002:3000"
-    networks:
-      - shipping_sovereign_network
-
-  fraud-service:
-    build: ./fraud-service
-    container_name: fraud-service
-    networks:
-      - shipping_sovereign_network
-
-  orchestrator-service:
-    build: ./orchestrator-service
-    container_name: orchestrator-service
-    networks:
-      - shipping_sovereign_network
+      - "3003:3000"
+    environment:
+      PORT: 3000
+    restart: unless-stopped
 ✨ Architectural Benchmarks Summary
 Zero-Coupling Database Access: Microservices communicate state exclusively down internal message fabrics; no operational service directly probes a foreign store.
 
